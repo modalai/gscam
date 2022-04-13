@@ -29,7 +29,11 @@ namespace gscam {
     void publish_stream();
     void cleanup_stream();
 
+
     void run();
+
+    void convert_raw10_to_raw8(uint8_t *pSrcPixel, uint8_t *pDestPixel, uint32_t widthPixels, uint32_t heightPixels);
+
 
   private:
     // General gstreamer configuration
@@ -37,6 +41,8 @@ namespace gscam {
 
     // Gstreamer structures
     GstElement *pipeline_;
+    GstElement *source_;
+    GstElement *transform_filter_;
     GstElement *sink_;
 
     // Appsink configuration
@@ -48,6 +54,8 @@ namespace gscam {
     // Camera publisher configuration
     std::string frame_id_;
     int width_, height_;
+    int camera_id_;
+    double man_exposure_time_;
     std::string image_encoding_;
     std::string camera_name_;
     std::string camera_info_url_;

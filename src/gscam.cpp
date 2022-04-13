@@ -27,6 +27,9 @@ extern "C"{
 
 #include <gscam/gscam.h>
 
+//#include <CL/cl.h>
+
+
 namespace gscam {
 
   GSCam::GSCam(ros::NodeHandle nh_camera, ros::NodeHandle nh_private) :
@@ -69,16 +72,21 @@ namespace gscam {
       ROS_INFO_STREAM("Using gstreamer config from rosparam: \""<<gsconfig_rosparam<<"\"");
     }
 
+
     // Get additional gscam configuration
     nh_private_.param("sync_sink", sync_sink_, true);
     nh_private_.param("preroll", preroll_, false);
     nh_private_.param("use_gst_timestamps", use_gst_timestamps_, false);
+    nh_private_.param("camera_id", camera_id_, 0);
 
     nh_private_.param("reopen_on_eof", reopen_on_eof_, false);
 
     // Get the camera parameters file
     nh_private_.getParam("camera_info_url", camera_info_url_);
     nh_private_.getParam("camera_name", camera_name_);
+
+    nh_private_.getParam("camera_exposure_time", man_exposure_time_);
+
 
     // Get the image encoding
     nh_private_.param("image_encoding", image_encoding_, sensor_msgs::image_encodings::RGB8);
@@ -107,6 +115,7 @@ namespace gscam {
     return true;
   }
 
+
   bool GSCam::init_stream()
   {
     if(!gst_is_initialized()) {
@@ -119,11 +128,18 @@ namespace gscam {
 
     GError *error = 0; // Assignment to zero is a gst requirement
 
+
+    sleep(camera_id_ * 1.5);
+
+#ifdef NOT_RB5
+    ROS_INFO( "[MODAL] attempt to parse pipeline " );
     pipeline_ = gst_parse_launch(gsconfig_.c_str(), &error);
     if (pipeline_ == NULL) {
       ROS_FATAL_STREAM( error->message );
       return false;
     }
+
+    ROS_INFO( "[MODAL] successful parsing of pipeline " );
 
     // Create RGB sink
     sink_ = gst_element_factory_make("appsink",NULL);
@@ -135,18 +151,22 @@ namespace gscam {
         caps = gst_caps_new_simple( "video/x-raw", 
             "format", G_TYPE_STRING, "RGB",
             NULL); 
+    	ROS_INFO( "[MODAL] setting appsink to RGB" );
     } else if (image_encoding_ == sensor_msgs::image_encodings::MONO8) {
         caps = gst_caps_new_simple( "video/x-raw", 
             "format", G_TYPE_STRING, "GRAY8",
             NULL); 
+    	ROS_INFO( "[MODAL] setting appsink to MONO" );
     } else if (image_encoding_ == "jpeg") {
         caps = gst_caps_new_simple("image/jpeg", NULL, NULL);
     }
 #else
     if (image_encoding_ == sensor_msgs::image_encodings::RGB8) {
         caps = gst_caps_new_simple( "video/x-raw-rgb", NULL,NULL); 
+    	ROS_INFO( "[MODAL < 1.0] setting appsink to RGB" );
     } else if (image_encoding_ == sensor_msgs::image_encodings::MONO8) {
         caps = gst_caps_new_simple("video/x-raw-gray", NULL, NULL);
+    	ROS_INFO( "[MODAL < 1.0] setting appsink to MONO8" );
     } else if (image_encoding_ == "jpeg") {
         caps = gst_caps_new_simple("image/jpeg", NULL, NULL);
     }
@@ -163,6 +183,9 @@ namespace gscam {
         (sync_sink_) ? TRUE : FALSE);
 
     if(GST_IS_PIPELINE(pipeline_)) {
+
+      ROS_INFO( "[MODAL] Setup PIPELINE" );
+
       GstPad *outpad = gst_bin_find_unlinked_pad(GST_BIN(pipeline_), GST_PAD_SRC);
       g_assert(outpad);
 
@@ -185,7 +208,11 @@ namespace gscam {
       }
 
       gst_object_unref(outelement);
+
     } else {
+
+      ROS_INFO( "[MODAL] no PIPELINE, create attempt" );
+
       GstElement* launchpipe = pipeline_;
       pipeline_ = gst_pipeline_new(NULL);
       g_assert(pipeline_);
@@ -199,7 +226,87 @@ namespace gscam {
         gst_object_unref(pipeline_);
         return false;
       }
-    }
+#endif
+
+      pipeline_ = gst_pipeline_new("rb5_camera");
+      source_ = gst_element_factory_make("qtiqmmfsrc", "source");
+      transform_filter_ = gst_element_factory_make("capsfilter", "transform_filter");
+      sink_ = gst_element_factory_make("appsink", "sink");
+
+      GstPad *bitrate_pad = gst_element_get_request_pad(source_, "video_%u");
+      int bitrate = 500000; //6000000;
+      int bit_control = 4;
+
+      if (bitrate > 0 )
+      {
+	  if (bitrate_pad != NULL)
+	  {
+	  	int bitrate_val = bitrate;
+	  	printf("Bitrate %d with control %d\n", bitrate_val, bit_control);
+      		GstCaps* bit_caps = gst_caps_new_simple(
+					    "video/x-bayer",
+	                                    "bitrate", G_TYPE_INT, bitrate_val,
+					    "bitrate-control", G_TYPE_INT, bit_control,
+	                                    NULL);
+
+		if (!gst_pad_set_caps(bitrate_pad, bit_caps)) {
+			ROS_FATAL("[ERROR] Failed to create bit_caps object");
+		}
+	  }
+      } 
+
+      GstPad* outpad = gst_element_get_static_pad(sink_, "sink");
+      if (gst_pad_link(bitrate_pad, outpad) != GST_PAD_LINK_OK) {
+		ROS_FATAL("[ERROR] Failed to LINK bit_caps object");
+      }
+
+      // Video source exposure
+      //double man_exposure_time = 0.06;
+      //double man_exposure_time = 0.5;
+      //double man_exposure_time = nh_private_.getParam("gscam_config",gsconfig_rosparam);
+      if (man_exposure_time_ > 0.0)
+      {
+          printf("MANUAL exposure %ld (ns)\n", (int64_t) (1000000.0*man_exposure_time_));
+    	  g_object_set(G_OBJECT(source_),
+			"camera", camera_id_,
+			"ae-mode", 0,
+			"exposure-time", (int64_t) (1000000.0*man_exposure_time_),
+			"white-balance-mode", 3 ,
+			NULL);
+      }
+      else
+      {
+    	  g_object_set(G_OBJECT(source_),
+			"camera", camera_id_,
+			NULL);
+      }
+
+      printf("Setting up camera # %d\n", camera_id_);
+
+      gst_bin_add_many(GST_BIN(pipeline_),
+				source_,
+				transform_filter_,
+				sink_, NULL);
+      gst_element_link_many(source_,
+				transform_filter_,
+				sink_, NULL);
+
+      GstCaps* transform_caps = gst_caps_new_simple("video/x-bayer",
+	                                    "format", G_TYPE_STRING, "mono",
+	                                    "bpp", G_TYPE_STRING, "10",
+	                                    "width", G_TYPE_INT, 640,
+	                                    "height", G_TYPE_INT, 480,
+	                                    "framerate", GST_TYPE_FRACTION, 20, 1,
+	                                    NULL);
+      g_object_set(G_OBJECT(transform_filter_), "caps", transform_caps, NULL);
+      if (!transform_caps)
+      {
+		ROS_FATAL("[ERROR] Failed to create transform_caps object");
+		return false;
+      }
+      gst_caps_unref(transform_caps);
+
+//    }
 
     // Calibration between ros::Time and gst timestamps
     GstClock * clock = gst_system_clock_obtain();
@@ -228,6 +335,23 @@ namespace gscam {
 
     return true;
   }
+
+  void GSCam::convert_raw10_to_raw8(uint8_t *pSrcPixel, uint8_t *pDestPixel, uint32_t widthPixels, uint32_t heightPixels)
+  {
+    uint32_t *destBuffer = (uint32_t *)pDestPixel;
+    // Figure out size of the raw8 destination buffer in 32 bit words
+    uint32_t destSize = (widthPixels * heightPixels) / 4;
+
+    for (uint32_t i = 0; i < destSize; i++)
+    {
+        *destBuffer++ = *((uint32_t *)pSrcPixel);
+        // Skip every fifth byte because that is just a collection of the 2
+        // least significant bits from the previous four pixels. We don't want
+        // those least significant bits.
+        pSrcPixel += 5;
+    }
+  }
+
 
   void GSCam::publish_stream()
   {
@@ -262,18 +386,49 @@ namespace gscam {
     }
     ROS_INFO("Started stream.");
 
+    GstSample *sample;
+    guint8 frame[640 * 480];
+
+    //GstBuffer *buffer;
+    //GstMapInfo map_info;
+
     // Poll the data as fast a spossible
     while(ros::ok()) 
     {
+       GstClock *clock;
+       clock = GST_ELEMENT_CLOCK(source_);
+       int64_t time = gst_clock_get_time(clock);
+
+       g_signal_emit_by_name(sink_, "pull-sample", &sample);
+       if (sample == NULL)
+       {
+            printf("[MODAL] Error-- Could not get frame from camera %d\n", camera_id_);
+            continue;
+       }
+
+#ifdef XXXX
+       buffer = gst_sample_get_buffer(sample);
+
+       // obtains frame map info from buffer
+       if (!gst_buffer_map((buffer), &map_info, GST_MAP_READ))
+       {
+           gst_buffer_unmap((buffer), &map_info);
+           gst_sample_unref(sample);
+           printf("[MODAL] Error-- Could not load buffer from camera %d\n",camera_id_);
+           continue;
+       }
+#endif
+
       // This should block until a new frame is awake, this way, we'll run at the
       // actual capture framerate of the device.
-      // ROS_DEBUG("Getting data...");
+      //ROS_DEBUG("Getting data...");
 #if (GST_VERSION_MAJOR == 1)
-      GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(sink_));
-      if(!sample) {
-        ROS_ERROR("Could not get gstreamer sample.");
-        break;
-      }
+      //GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(sink_));
+      //if(!sample) {
+      //  ROS_ERROR("Could not get gstreamer sample.");
+      //  break;
+      //}
+      
       GstBuffer* buf = gst_sample_get_buffer(sample);
       GstMemory *memory = gst_buffer_get_memory(buf, 0);
       GstMapInfo info;
@@ -294,7 +449,6 @@ namespace gscam {
 #if 0
       GstFormat fmt = GST_FORMAT_TIME;
       gint64 current = -1;
-
        Query the current position of the stream
       if (gst_element_query_position(pipeline_, &fmt, &current)) {
           ROS_INFO_STREAM("Position "<<current);
@@ -346,10 +500,7 @@ namespace gscam {
           cinfo_pub_.publish(cinfo);
       } else {
           // Complain if the returned buffer is smaller than we expect
-          const unsigned int expected_frame_size =
-              image_encoding_ == sensor_msgs::image_encodings::RGB8
-              ? width_ * height_ * 3
-              : width_ * height_;
+          const unsigned int expected_frame_size = width_ * height_;
 
           if (buf_size < expected_frame_size) {
               ROS_WARN_STREAM( "GStreamer image buffer underflow: Expected frame to be "
@@ -377,10 +528,10 @@ namespace gscam {
           } else {
               img->step = width_;
           }
-          std::copy(
-                  buf_data,
-                  (buf_data)+(buf_size),
-                  img->data.begin());
+
+	  //ROS_INFO("w: %d h:%d size: %d", width_, height_, expected_frame_size);
+          convert_raw10_to_raw8(buf_data, frame, 640, 480);
+	  memcpy(&img->data[0], frame, expected_frame_size);
 
           // Publish the image/info
           camera_pub_.publish(img, cinfo);
@@ -395,8 +546,10 @@ namespace gscam {
         gst_buffer_unref(buf);
       }
 
+
       ros::spinOnce();
     }
+
   }
 
   void GSCam::cleanup_stream()
@@ -411,6 +564,9 @@ namespace gscam {
   }
 
   void GSCam::run() {
+
+    ROS_INFO("**** Using MODALAI gstreamer for VOXL-ROS version 1.0 **** ");
+
     while(ros::ok()) {
       if(!this->configure()) {
         ROS_FATAL("Failed to configure gscam!");
